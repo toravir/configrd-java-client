@@ -1,7 +1,7 @@
 package io.configrd.client;
 
 import java.util.Properties;
-import io.configrd.core.discovery.DefaultMergeStrategy;
+import io.configrd.core.DefaultMergeStrategy;
 
 /**
  * Interface for configuration implementations.
