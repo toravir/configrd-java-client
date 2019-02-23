@@ -1,70 +1,404 @@
 package io.configrd.client;
 
-import java.io.IOException;
+import java.io.File;
 import java.net.URI;
+import java.net.UnknownHostException;
+import java.security.cert.CertificateException;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.Set;
+import java.util.StringJoiner;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
-import org.jasypt.encryption.pbe.StandardPBEStringEncryptor;
-import org.jasypt.encryption.pbe.config.EnvironmentStringPBEConfig;
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.SSLSocketFactory;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
+import org.apache.commons.beanutils.ConvertUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import io.configrd.client.discovery.ConfigDiscoveryStrategy;
-import io.configrd.client.discovery.HostsFileDiscoveryStrategy;
+import io.configrd.core.Config;
 import io.configrd.core.ConfigSourceResolver;
 import io.configrd.core.DefaultMergeStrategy;
 import io.configrd.core.Environment;
 import io.configrd.core.MergeStrategy;
-import io.configrd.core.SystemProperties;
 import io.configrd.core.exception.InitializationException;
+import io.configrd.core.file.FileRepoDef;
+import io.configrd.core.processor.ProcessorSelector;
+import io.configrd.core.processor.ProcessorSelector.Type;
 import io.configrd.core.processor.PropertiesProcessor;
 import io.configrd.core.source.ConfigSource;
-import io.configrd.core.util.CfgrdURI;
+import io.configrd.core.source.RepoDef;
+import io.configrd.core.source.SecuredRepo;
+import io.configrd.core.source.StreamPacket;
 import io.configrd.core.util.StringUtils;
-import io.configrd.core.util.UriUtil;
+import okhttp3.HttpUrl;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
 
 /**
  * 
  * @author Krzysztof Karski
  *
  */
-public class ConfigClient implements Config {
+public class ConfigClient {
 
-  public enum Method {
+  protected abstract class BaseClientBuilder {
+
+    protected Map<String, Object> vals = new HashMap<>();
+    protected String uri;
+    protected String path;
+    protected ConfigSourceResolver sourceResolver;
+    protected Integer timerTTL = 0;
+
+    protected BaseClientBuilder(String uri) {
+      this.vals.put(RepoDef.URI_FIELD, uri);
+      this.vals.put(RepoDef.SOURCE_NAME_FIELD, detectSourceName(uri));
+      this.vals.put(RepoDef.NAME_FIELD, "default");
+      this.vals.put(RepoDef.TRUST_CERTS_FIELD, "false");
+      this.vals.put("path", path);
+    }
+
+    public BaseClientBuilder basicAuth(String username, String password) {
+      vals.put(SecuredRepo.USERNAME_FIELD, username);
+      vals.put(SecuredRepo.PASSWORD_FIELD, password);
+      vals.put(SecuredRepo.AUTH_METHOD_FIELD, "HttpBasicAuth");
+      return this;
+    }
+
+    public abstract Config build();
 
     /**
-     * Fully qualified URI to the properites location
+     * Change the config file name from default.properties.
+     * 
+     * @param name i.e. "myvars.yaml, myvars.properties, myvars.json"
+     * @return
      */
-    ABSOLUTE_URI,
+    public BaseClientBuilder fileName(String name) {
+      vals.put(FileRepoDef.FILE_NAME_FIELD, name);
+      return this;
+    }
+
+    public BaseClientBuilder path(String path) {
+      this.path = path;
+      return this;
+    }
+
+    public BaseClientBuilder refresh(int seconds) {
+      this.timerTTL = seconds;
+      return this;
+    }
 
     /**
-     * A cfgrd:// uri format pointing at a repo name and relative path with the repo
+     * Override source name detection.
+     * 
+     * @param name file or http is supported
+     * @return
      */
-    CONFIGRD_URI,
+    public BaseClientBuilder sourceName(String name) {
+      vals.put(RepoDef.SOURCE_NAME_FIELD, name);
+      return this;
+    }
 
     /**
-     * Lookup properties location via hosts file
+     * In case connecting over http/s, trust certs by default.
+     * 
+     * @param trust true or false. default: false
+     * @return
      */
-    HOST_FILE,
+    public BaseClientBuilder trustCerts(boolean trust) {
+      vals.put(RepoDef.TRUST_CERTS_FIELD, String.valueOf(trust));
+      return this;
+    }
+  }
+
+  protected class ConfigImpl implements Config, Refresh {
+
+    private final ConfigSource configSource;
+    private String path;
+    private Set<String> named = new HashSet<>();
+
+    private final AtomicReference<Properties> loadedProperties =
+        new AtomicReference<>(new Properties());
+
+    protected ConfigImpl(ConfigSource configSource, Set<String> named) {
+      this.configSource = configSource;
+      this.named = named;
+      refresh();
+    }
+
+    protected ConfigImpl(ConfigSource configSource, String path) {
+      this.configSource = configSource;
+      this.path = path;
+      refresh();
+    }
+
+    public Properties getProperties() {
+      Properties props = new Properties();
+      props.putAll(loadedProperties.get());
+      return props;
+    }
+
+    public <T> T getProperty(String key, Class<T> clazz) {
+
+      String value = loadedProperties.get().getProperty(key);
+
+      if (StringUtils.hasText(value)) {
+        return (T) ConvertUtils.convert(value, clazz);
+      }
+
+      return null;
+    }
+
+    public <T> T getProperty(String key, Class<T> clazz, T value) {
+
+      T val = getProperty(key, clazz);
+
+      if (val != null && val != "")
+        return val;
+
+      return value;
+
+    }
+
+    public void refresh() {
+
+      final MergeStrategy merge = new DefaultMergeStrategy();
+
+      if (configSource != null) {
+
+        Map<String, Object> p = configSource.get(path, named);
+        merge.addConfig(p);
+
+      }
+
+      // Variables defined on host override
+      merge.addConfig((Map) environment.getEnvironment());
+      Map<String, Object> merged = merge.merge();
+      loadedProperties.set(PropertiesProcessor.asProperties(new StringUtils(merged).filled()));
+      logger.info("Configs loaded.");
+    }
+
+  }
+
+  public class ConfigrdConfigClientBuilder extends BaseClientBuilder {
+
+    private String repoName = "default";
+    private String[] namedPaths = new String[] {};
+
+    protected ConfigrdConfigClientBuilder(String uri) {
+      super(uri);
+    }
+
+    public Config build() {
+
+      final String sourceName = (String) vals.get(RepoDef.SOURCE_NAME_FIELD);
+      this.sourceResolver = new ConfigSourceResolver(vals);
+      Optional<ConfigSource> cs = sourceResolver.findByRepoName(repoName);
+
+      if (cs.isPresent()) {
+
+        ConfigImpl c = null;
+        
+        if (namedPaths.length > 0) {
+          c = new ConfigImpl(cs.get(), new HashSet<>(Arrays.asList(namedPaths)));
+        } else {
+          c = new ConfigImpl(cs.get(), path);
+        }
+
+        if (this.timerTTL > 0) {
+          timer.get().schedule(new ReloadTask(c), (this.timerTTL * 1000), (this.timerTTL * 1000));
+        }
+
+        return c;
+
+      } else {
+
+        logger.error("Unable find config source '" + sourceName + "' to load uri " + uri);
+
+        throw new InitializationException(
+            "Unable find config source '" + sourceName + "' to load uri " + uri);
+
+      }
+    }
+
+    public ConfigrdConfigClientBuilder named(String... names) {
+      this.namedPaths = names;
+      return this;
+    }
+
+    public ConfigrdConfigClientBuilder repo(String repo) {
+      this.repoName = repo;
+      return this;
+    }
+
+  }
+
+  public class ConfigrdServerClientBuilder {
+
+    private String uri;
+    private String repoName;
+    private String[] namedPaths = new String[] {};
+    private String path;
+    protected Integer timerTTL = 0;
+    protected boolean trustCerts = false;
+    protected OkHttpClient client;
+
+    protected ConfigrdServerClientBuilder(String uri) {
+      this.uri = uri;
+    }
+
+    public Config build() {
+
+      final OkHttpClient.Builder builder = new OkHttpClient.Builder();
+
+      if (this.trustCerts) {
+        try {
+
+          final SSLContext sslContext = SSLContext.getInstance("TSL");
+          sslContext.init(null, trustAllCerts, new java.security.SecureRandom());
+          final SSLSocketFactory sslSocketFactory = sslContext.getSocketFactory();
+
+          builder.sslSocketFactory(sslSocketFactory, (X509TrustManager) trustAllCerts[0]);
+          builder.hostnameVerifier(new HostnameVerifier() {
+            @Override
+            public boolean verify(String hostname, SSLSession session) {
+              return true;
+            }
+          });
+
+        } catch (Exception e) {
+          logger.error(e.getMessage());
+        }
+      }
+
+      builder.connectTimeout(10, TimeUnit.SECONDS);
+      builder.writeTimeout(10, TimeUnit.SECONDS);
+      builder.readTimeout(30, TimeUnit.SECONDS);
+
+      client = builder.build();
+      URI i = URI.create(uri);
+
+      if (path.startsWith("/")) {
+        path = path.replaceFirst("/", "");
+      }
+
+      String root = i.getPath();
+      if (root.startsWith("/")) {
+        root = root.replaceFirst("/", "");
+      }
+
+      HttpUrl.Builder httpBuilder = new HttpUrl.Builder().scheme(i.getScheme()).host(i.getHost())
+          .addPathSegments(root).addPathSegments(path);
+
+      if (i.getPort() > 0) {
+        httpBuilder.port(i.getPort());
+      }
+
+      if (namedPaths.length > 0) {
+        StringJoiner joiner = new StringJoiner(",");
+
+        for (String n : namedPaths) {
+          joiner.add(n);
+        }
+        httpBuilder.addQueryParameter("p", joiner.toString());
+      }
+
+      if (StringUtils.hasText(repoName)) {
+        httpBuilder.addQueryParameter("r", repoName);
+      }
+
+      Request.Builder request = new Request.Builder().url(httpBuilder.build())
+          .addHeader("Accept", "application/json").get();
+
+      logger.info("Fetching " + httpBuilder.toString());
+
+      try (Response call = client.newCall(request.build()).execute()) {
+
+        if (call.isSuccessful() && !call.isRedirect() && call.body().contentLength() > 0) {
+
+          StreamPacket packet = new StreamPacket(URI.create(uri), call.body().byteStream());
+          packet.setETag(call.header("ETag"));
+          packet.putAll(ProcessorSelector.process(Type.JSON, packet.bytes()));
+          return packet;
+
+        } else if (call.isSuccessful() && call.isRedirect()) {
+
+          logger.error("Redirect handling not implemented. Server returned location "
+              + call.header("location"));
+        }
+
+      } catch (UnknownHostException e) {
+
+        logger.error(e.getMessage(), e);
+        throw new IllegalArgumentException(e.getMessage());
+
+      } catch (Exception e) {
+        logger.debug(e.getMessage(), e);
+        // nothing else
+      }
+
+      return new StreamPacket(URI.create(uri));
+    }
+
+    public ConfigrdServerClientBuilder named(String... names) {
+      this.namedPaths = names;
+      return this;
+    }
+
+    public ConfigrdServerClientBuilder path(String path) {
+      this.path = path;
+      return this;
+    }
+
+    public ConfigrdServerClientBuilder refresh(int seconds) {
+      this.timerTTL = seconds;
+      return this;
+    }
+
+    public ConfigrdServerClientBuilder repo(String name) {
+      this.repoName = name;
+      return this;
+    }
 
     /**
-     * Lookup properties location via configrd server
+     * In case connecting over http/s, trust certs by default.
+     * 
+     * @param trust true or false. default: false
+     * @return
      */
-    REDIRECT;
+    public ConfigrdServerClientBuilder trustCerts() {
+      this.trustCerts = true;
+      return this;
+    }
+  }
+
+  private interface Refresh {
+    public void refresh();
   }
 
   private class ReloadTask extends TimerTask {
+
+    private Refresh client;
+
+    ReloadTask(Refresh client) {
+      this.client = client;
+    }
 
     @Override
     public void run() {
       try {
 
-        init();
+        client.refresh();
 
       } catch (Exception e) {
         logger.error("Error refreshing configs", e);
@@ -72,194 +406,121 @@ public class ConfigClient implements Config {
     }
   }
 
+  public class SimpleConfigClientBuilder extends BaseClientBuilder {
+
+    protected SimpleConfigClientBuilder(String uri) {
+      super(uri);
+    }
+
+    public Config build() {
+
+      final String sourceName = (String) vals.get(RepoDef.SOURCE_NAME_FIELD);
+      this.sourceResolver = new ConfigSourceResolver();
+      Optional<ConfigSource> cs = sourceResolver.buildConfigSource("default", vals);
+
+      if (cs.isPresent()) {
+
+        ConfigImpl c = new ConfigImpl(cs.get(), path);
+        if (this.timerTTL > 0) {
+          timer.get().schedule(new ReloadTask(c), (this.timerTTL * 1000), (this.timerTTL * 1000));
+        }
+
+        return c;
+
+      } else {
+
+        logger.error("Unable find config source '" + sourceName + "' to load uri " + uri);
+
+        throw new InitializationException(
+            "Unable find config source '" + sourceName + "' to load uri " + uri);
+
+      }
+    }
+
+  }
 
   private final static Logger logger = LoggerFactory.getLogger(ConfigClient.class);
 
-  private StandardPBEStringEncryptor encryptor = null;
+  private static final AtomicReference<Timer> timer = new AtomicReference<Timer>(new Timer(true));
+
+  private static final TrustManager[] trustAllCerts = new TrustManager[] {new X509TrustManager() {
+    @Override
+    public void checkClientTrusted(java.security.cert.X509Certificate[] chain, String authType)
+        throws CertificateException {}
+
+    @Override
+    public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType)
+        throws CertificateException {}
+
+    @Override
+    public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+      return new java.security.cert.X509Certificate[] {};
+    }
+  }};
+
+  /**
+   * Build a config client sourcing configurations directly from a known absolute URI location such
+   * as files on disc, on classpath or over http/s.
+   * 
+   * @param uri The absolute URI to the configs including file name to fetch.
+   * @return
+   */
+  public static SimpleConfigClientBuilder config(String uri) {
+
+    return new ConfigClient().new SimpleConfigClientBuilder(uri);
+
+  }
+
+  /**
+   * Build a config client source configurations based on a repo configuration from a configrd
+   * config file
+   * 
+   * @param uri the configrd config file's absolute URI location
+   * @return
+   */
+  public static ConfigrdConfigClientBuilder configrdconfg(String uri) {
+    return new ConfigClient().new ConfigrdConfigClientBuilder(uri);
+  }
+
+  /**
+   * Build a config client source configurations from a remote configrd server instance.
+   * 
+   * @param uri the server's URL with scheme, host, port and root (i.e.
+   *        https://host:port/configrd/v1/).
+   * @return
+   */
+  public static ConfigrdServerClientBuilder server(String uri) {
+    return new ConfigClient().new ConfigrdServerClientBuilder(uri);
+  }
 
   public final Environment environment = new Environment();
 
-  private final AtomicReference<Properties> loadedProperties =
-      new AtomicReference<>(new Properties());
-
-  private ConfigDiscoveryStrategy lookupStrategy = new HostsFileDiscoveryStrategy();
-
-  private final Method method;
-
-  protected String repoDefLocation;
-
-  protected final ConfigSourceResolver sourceResolver;
-
-  protected final URI startLocation;
-
-  private AtomicReference<Timer> timer = new AtomicReference<Timer>();
-
-  protected Integer timerTTL = 0;
-
   /**
    * 
-   * @param uri - The path of the starting point for config exploration. Can be a default.properties
-   *        or hosts.properties path
-   * @param refresh - The period in seconds at which the config properties should be refreshed. 0
-   *        indicates no automated timer
+   * @param uri Connect to a config repo by specifying an aboslute URI (file, http(s)) to the root
+   *        of the repo. The location must be accessible to the client
    * @throws Exception
    */
-  // public ConfigClient(String uri) {
-  //
-  // assert StringUtils.hasText(uri) : "Host or properties file path null or empty";
-  // this.startLocation = URI.create(uri);
-  // this.method = Method.ABSOLUTE_URI;
-  // this.sourceResolver = new ConfigSourceResolver(DEFAULT_CONFIGRD_CONFIG_URI, null);
-  // }
+  public ConfigClient() {
 
-  /**
-   * 
-   * @param uri The path of the starting point for config exploration. Can be a default.properties
-   *        or hosts.properties path
-   * @throws Exception
-   */
-  public ConfigClient(String repoDefPath, String uri, Method method) throws IOException {
-
-    assert StringUtils.hasText(repoDefPath) : "configrd.config.uri is null or empty";
-    assert StringUtils.hasText(uri) : "Host or properties file path null or empty";
-    assert method != null : "Method must be specified";
-
-    this.repoDefLocation = repoDefPath;
-    this.startLocation = URI.create(uri);
-    this.method = method;
-
-    Map<String, Object> vals = new HashMap<>();
-    vals.put(SystemProperties.CONFIGRD_CONFIG_URI, repoDefLocation);
-
-    this.sourceResolver = new ConfigSourceResolver(vals);
   }
+
+  private String detectSourceName(String uri) {
+
+    if (uri == "" || uri.toLowerCase().startsWith(File.separator + File.separator)
+        || uri.toLowerCase().startsWith("file:") || uri.toLowerCase().startsWith("classpath")) {
+      return "file";
+    } else if (uri.trim().startsWith("http")) {
+      return "http";
+    } else {
+      logger.warn("Unable to determine file, classpath or http/s config source from uri " + uri);
+      return "";
+    }
+  }
+
 
   public Environment getEnvironment() {
     return environment;
-  }
-
-  public Properties getProperties() {
-    Properties props = new Properties();
-    props.putAll(loadedProperties.get());
-    return props;
-  }
-
-  public <T> T getProperty(String key, Class<T> clazz) {
-
-    String value = loadedProperties.get().getProperty(key);
-
-    if (StringUtils.hasText(value)) {
-      return StringUtils.cast(value, clazz);
-    }
-
-    return null;
-  }
-
-  public <T> T getProperty(String key, Class<T> clazz, T value) {
-
-    T val = getProperty(key, clazz);
-
-    if (val != null && val != "")
-      return val;
-
-    return value;
-
-  }
-
-  public ConfigSourceResolver getSourceResolver() {
-    return sourceResolver;
-  }
-
-  public void init() {
-
-    Optional<URI> startPath = Optional.empty();
-
-    if (this.method.equals(Method.ABSOLUTE_URI)) {
-
-      if (UriUtil.validate(startLocation).isAbsolute().invalid()) {
-        throw new IllegalArgumentException("Uri must be an absolute URI to the config location.");
-      }
-
-      startPath = Optional.of(this.startLocation);
-
-    } else {
-
-      /*
-       * Any of the below resolvers can return either an absolute URI or a cfgrd URI therefore a
-       * repo configuration is required. They SHOULD NOT return another redirect URI but there is
-       * nothing preventing it
-       */
-
-      if (this.method.equals(Method.HOST_FILE)) {
-
-        startPath = resolveConfigPathFromHostFile(startLocation);
-
-      } else if (this.method.equals(Method.REDIRECT)) {
-
-        startPath = resolveConfigPathFromConfigrd(startLocation);
-
-      } else if (this.method.equals(Method.CONFIGRD_URI)) {
-
-        startPath = Optional.of(this.startLocation);
-
-      }
-    }
-
-
-    Optional<ConfigSource> configSource = Optional.empty();
-
-    if (startPath.isPresent()) {
-
-      configSource = resolveConfigSource(startPath.get());
-
-    } else {
-
-      logger.error(
-          "Unable to locate a config properties path using search location " + this.startLocation);
-
-      throw new InitializationException(
-          "Unable to locate a config properties path using search location " + this.startLocation);
-    }
-
-    final MergeStrategy merge = new DefaultMergeStrategy();
-
-    if (configSource.isPresent()) {
-
-      final String path = UriUtil.getPath(startPath.get());
-
-      Map<String, Object> p = configSource.get().get(path, new HashSet<String>());
-
-      if (p.isEmpty()) {
-        logger.warn("Config location " + startPath.get()
-            + " return an empty set of properties. Please check the location");
-      }
-
-      merge.addConfig(p);
-
-    } else {
-
-      logger.error("Unable to locate a config source for search location " + this.startLocation
-          + " and config path " + startPath.get());
-
-      throw new InitializationException("Unable to locate a config source for search location "
-          + this.startLocation + " and config path " + startPath.get());
-
-    }
-
-    merge.addConfig((Map) environment.getEnvironment());
-    Map<String, Object> merged = merge.merge();
-
-    if (merged.isEmpty()) {
-      logger.warn("Properties collection returned empty per search location " + this.startLocation
-          + " and config path " + startPath.get()
-          + ". If this is unexpected, please check your configuration.");
-    } else {
-
-      loadedProperties.set(PropertiesProcessor.asProperties(new StringUtils(merged).filled()));
-
-    }
-
-    logger.info("ConfigClient initialized.");
   }
 
   protected Optional<URI> resolveConfigPathFromConfigrd(URI serverPath) {
@@ -267,91 +528,5 @@ public class ConfigClient implements Config {
     return Optional.empty();
 
   }
-
-  protected Optional<URI> resolveConfigPathFromHostFile(URI hostFilePath) {
-
-    Map<String, Object> hosts = new HashMap<>();
-    logger.info("Loading hosts file at " + startLocation);
-    Optional<URI> startPath = Optional.empty();
-
-    Optional<ConfigSource> source =
-        this.sourceResolver.locateConfigSourceFactory(hostFilePath, null);
-
-    if (source.isPresent()) {
-      String path = UriUtil.getPath(hostFilePath);
-
-      hosts = source.get().getRaw(path);
-      startPath = lookupStrategy.lookupConfigPath(hosts, (Map) environment.getEnvironment());
-    }
-
-    return startPath;
-  }
-
-  protected Optional<ConfigSource> resolveConfigSource(URI startPath) {
-
-    Optional<ConfigSource> cs = Optional.empty();
-
-    if (CfgrdURI.isCfgrdURI(startPath)) {
-
-      CfgrdURI cfgrd = new CfgrdURI(startPath);
-
-      cs = this.sourceResolver.findByRepoName(cfgrd.getRepoName());
-
-    } else {
-
-      cs = this.sourceResolver.locateConfigSourceFactory(startPath, null);
-    }
-
-    return cs;
-  }
-
-  /**
-   * Set password on the encryptor. If an encryptor isn't configured, a BasicTextEncryptor will be
-   * initialized and the password set on it. The basic assumed encryption algorithm is
-   * PBEWithMD5AndDES. This can be changed by setting the StandardPBEStringEncryptor.
-   * 
-   * @param password
-   */
-  public void setPassword(String password) {
-
-    this.encryptor = new StandardPBEStringEncryptor();
-    EnvironmentStringPBEConfig configurationEncryptor = new EnvironmentStringPBEConfig();
-    configurationEncryptor.setAlgorithm("PBEWithMD5AndDES");
-    configurationEncryptor.setPassword(password);
-    encryptor.setConfig(configurationEncryptor);
-
-  }
-
-  protected void setRefreshRate(Integer refresh) {
-
-    this.timerTTL = refresh;
-
-    if (timer.get() != null && (refresh == 0L || refresh == null)) {
-
-      timer.get().cancel();
-      return;
-
-    } else if (refresh > 0) {
-
-      Timer t2 = new Timer(true);
-      t2.schedule(new ReloadTask(), refresh * 1000, refresh * 1000);
-
-      Timer t1 = timer.getAndSet(t2);
-      if (t1 != null)
-        t1.cancel();
-    }
-
-  }
-
-  /**
-   * Override default text encryptor (StandardPBEStringEncryptor). Enables overriding both password
-   * and algorithm.
-   * 
-   * @param encryptor
-   */
-  public void setTextEncryptor(StandardPBEStringEncryptor config) {
-    this.encryptor = config;
-  }
-
 
 }

@@ -1,0 +1,32 @@
+service:
+  defaults:
+    fileName: default.properties
+    hostsName: hosts.properties
+  repos:
+    git-master:
+      uri: git://git@github.com:configrd/configrd-client.git#master
+      root: src/test/resources
+      sourceName: git
+    http-resource:
+      uri: https://raw.githubusercontent.com/configrd/configrd-core/master/src/test/resources
+      username: 
+      password:
+      fileName: default.properties
+      hostsName: hosts.properties
+      sourceName: http
+      named:
+        custom: env/dev/custom
+        simple: env/dev/simple
+    tmp-configs:
+      uri: file:/var/tmp/configs
+      sourceName: file
+    appx-d:
+      uri: classpath:/env/dev
+      fileName: default.json
+      sourceName: file
+    default:
+      uri: classpath:/
+      sourceName: file
+      named:
+        custom: env/dev/custom
+        simple: env/dev/simple

@@ -1,0 +1,37 @@
+version: 2
+jobs:
+  build-components:
+    docker:
+    - image: circleci/openjdk:8-jdk
+    environment:
+      CC_TEST_REPORTER_ID: 269aef8f8e92ff9098164f7454b5c1b715c1fa5f955f2aaa31770771ee82fd38
+    steps:
+    - checkout
+    - run: mvn clean install -B -s .circleci/settings.xml
+    - save_cache:
+        key: configrd-java-client-{{ .Branch }}-{{ checksum "pom.xml" }}-{{ .Environment.CIRCLE_SHA1 }}
+        paths:
+        - target
+        - ~/.m2
+    - store_test_results:
+        path: target/surefire-reports
+  deploy-components:
+    docker:
+    - image: circleci/openjdk:8-jdk
+    steps:
+    - checkout
+    - restore_cache:
+        keys:
+        - configrd-java-client-{{ .Branch }}-{{ checksum "pom.xml" }}-{{.Environment.CIRCLE_SHA1}}
+    - run: mvn jar:jar deploy:deploy -B -DskipTests  -s .circleci/settings.xml
+    - store_artifacts:
+        path: target
+
+workflows:
+    version: 2
+    build-push:
+      jobs:
+      - build-components
+      - deploy-components:
+          requires:
+          - build-components

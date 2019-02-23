@@ -1,0 +1,8 @@
+service:
+  defaults:
+    fileName: default.properties
+    hostsName: hosts.properties
+  repos:
+    default:
+      uri: classpath:/
+      sourceName: file
