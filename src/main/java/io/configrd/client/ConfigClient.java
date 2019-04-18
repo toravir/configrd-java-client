@@ -203,7 +203,7 @@ public class ConfigClient {
 
       final String sourceName = (String) vals.get(RepoDef.SOURCE_NAME_FIELD);
       this.sourceResolver = new ConfigSourceResolver(vals);
-      Optional<ConfigSource> cs = sourceResolver.findByRepoName(repoName);
+      Optional<ConfigSource> cs = sourceResolver.findConfigSourceByName(repoName);
 
       if (cs.isPresent()) {
 
@@ -416,7 +416,7 @@ public class ConfigClient {
 
       final String sourceName = (String) vals.get(RepoDef.SOURCE_NAME_FIELD);
       this.sourceResolver = new ConfigSourceResolver();
-      Optional<ConfigSource> cs = sourceResolver.buildConfigSource("default", vals);
+      Optional<ConfigSource> cs = sourceResolver.newConfigSource("default", vals);
 
       if (cs.isPresent()) {
 
