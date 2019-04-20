@@ -52,7 +52,7 @@ import okhttp3.Response;
  */
 public class ConfigClient {
 
-  protected abstract class BaseClientBuilder {
+  public abstract class BaseClientBuilder {
 
     protected Map<String, Object> vals = new HashMap<>();
     protected String uri;
